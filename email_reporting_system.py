@@ -18,6 +18,10 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
+import matplotlib
+matplotlib.use('Agg')  # Backend non-interactiv pentru server
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from unified_hub_report_generator import UnifiedHubReportGenerator, BRASOV_CONFIG, SIBIU_CONFIG
 
 class EmailReportingSystem:
@@ -219,6 +223,136 @@ class EmailReportingSystem:
         
         return df
     
+    def get_centre_report_last_3_days(self, centru, data_raport):
+        """Obține raportul pentru un centru pe ultimele 3 zile cu statistici zilnice"""
+        conn = sqlite3.connect(self.db_path)
+        
+        # Calculăm data de start pentru ultimele 3 zile (inclusiv data raportului)
+        data_end = datetime.strptime(data_raport, '%Y-%m-%d')
+        data_start = data_end - timedelta(days=2)  # 3 zile: azi, ieri, alaltăieri
+        data_start_str = data_start.strftime('%Y-%m-%d')
+        
+        query = '''
+            SELECT 
+                data_raport,
+                centru,
+                ruta,
+                nr_colete,
+                greutate,
+                procent_iesire_centru,
+                procent_intrare_centru
+            FROM rapoarte_istoric
+            WHERE centru = ? 
+                AND data_raport >= ? 
+                AND data_raport <= ?
+            ORDER BY data_raport DESC, ruta
+        '''
+        
+        df = pd.read_sql_query(query, conn, params=(centru, data_start_str, data_raport))
+        conn.close()
+        
+        return df
+    
+    def get_daily_stats_last_3_days(self, centru, data_raport):
+        """Calculează statistici zilnice pentru ultimele 3 zile"""
+        df = self.get_centre_report_last_3_days(centru, data_raport)
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Grupăm pe zi și calculăm statisticile
+        daily_stats = df.groupby('data_raport').agg({
+            'nr_colete': 'sum',
+            'greutate': 'sum',
+            'procent_iesire_centru': 'mean',
+            'procent_intrare_centru': 'mean'
+        }).round(2)
+        
+        # Calculăm diferențele și tendințele
+        daily_stats = daily_stats.sort_index()
+        daily_stats['diferenta_colete'] = daily_stats['nr_colete'].diff()
+        daily_stats['procent_diferenta'] = ((daily_stats['nr_colete'].diff() / daily_stats['nr_colete'].shift(1)) * 100).round(1)
+        
+        # Adăugăm tendința
+        daily_stats['tendinta'] = daily_stats['diferenta_colete'].apply(
+            lambda x: '📈 Creștere' if x > 0 else '📉 Scădere' if x < 0 else '➡️ Constant'
+        )
+        
+        # Pentru prima zi (nu are diferență)
+        daily_stats.loc[daily_stats.index[0], 'tendinta'] = '📊 Bază'
+        
+        return daily_stats
+    
+    def generate_evolution_chart(self, centru, data_raport):
+        """Generează graficul de evoluție pentru ultimele 3 zile"""
+        daily_stats = self.get_daily_stats_last_3_days(centru, data_raport)
+        
+        if daily_stats.empty:
+            return None
+        
+        # Configurare matplotlib pentru română
+        plt.rcParams['font.size'] = 10
+        plt.rcParams['axes.titlesize'] = 12
+        plt.rcParams['axes.labelsize'] = 10
+        
+        # Creează figura
+        fig, ax = plt.subplots(figsize=(10, 6))
+        fig.patch.set_facecolor('white')
+        
+        # Pregătește datele
+        dates = [datetime.strptime(date, '%Y-%m-%d') for date in daily_stats.index]
+        scanari = daily_stats['nr_colete'].values
+        
+        # Graficul principal - linie cu puncte
+        ax.plot(dates, scanari, marker='o', linewidth=3, markersize=8, 
+                color='#3498db', markerfacecolor='#2980b9', markeredgecolor='white', 
+                markeredgewidth=2, label='Scanări zilnice')
+        
+        # Adaugă bare subtiri pentru claritate
+        ax.bar(dates, scanari, alpha=0.3, color='#3498db', width=0.5)
+        
+        # Adaugă valorile pe grafic
+        for i, (date, value) in enumerate(zip(dates, scanari)):
+            ax.annotate(f'{int(value):,}', (date, value), 
+                       textcoords="offset points", xytext=(0,10), 
+                       ha='center', va='bottom', fontweight='bold',
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
+                               edgecolor='#3498db', alpha=0.8))
+        
+        # Calculează și afișează media
+        media = scanari.mean()
+        ax.axhline(y=media, color='#e74c3c', linestyle='--', alpha=0.7, 
+                  label=f'Media: {int(media):,} scanări')
+        
+        # Configurare axe
+        ax.set_xlabel('Data', fontweight='bold')
+        ax.set_ylabel('Numărul de scanări', fontweight='bold')
+        ax.set_title(f'Evoluția scanărilor - {centru}\nUltimele 3 zile', 
+                    fontweight='bold', pad=20)
+        
+        # Formatare axă X pentru date
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
+        ax.xaxis.set_major_locator(mdates.DayLocator())
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha='center')
+        
+        # Grid pentru claritate
+        ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        # Legende
+        ax.legend(loc='upper right', framealpha=0.9)
+        
+        # Ajustare layout
+        plt.tight_layout()
+        
+        # Salvează graficul
+        chart_path = os.path.join(self.utile_path, f'chart_{centru}_{data_raport}.png')
+        plt.savefig(chart_path, dpi=150, bbox_inches='tight', 
+                   facecolor='white', edgecolor='none')
+        plt.close()  # Închide figura pentru a elibera memoria
+        
+        return chart_path
+    
     def create_email_config_template(self):
         """Creează template pentru configurația email"""
         config_template = {
@@ -354,15 +488,50 @@ class EmailReportingSystem:
             raise Exception(f"Eroare la citirea fișierului Excel: {str(e)}")
     
     def generate_email_report_html(self, centru, raport_data, data_raport=None):
-        """Generează raportul HTML pentru email"""
-        if raport_data.empty:
+        """Generează raportul HTML pentru email - ULTIMELE 3 ZILE cu grafic"""
+        # Obține statisticile zilnice pentru ultimele 3 zile
+        daily_stats = self.get_daily_stats_last_3_days(centru, data_raport)
+        
+        if daily_stats.empty:
             return f"""
-            <h2>Raport Centru {centru} - Ultimele 30 zile</h2>
-            <p>Nu există date disponibile pentru acest centru în ultimele 30 de zile.</p>
+            <html>
+            <body>
+                <h2>Raport Centru {centru} - Ultimele 3 zile</h2>
+                <p>Nu există date disponibile pentru acest centru în ultimele 3 zile.</p>
+            </body>
+            </html>
             """
         
         # Data raportului pentru afișare
         data_display = data_raport if data_raport else datetime.now().strftime('%Y-%m-%d')
+        data_display_formatted = datetime.strptime(data_display, '%Y-%m-%d').strftime('%d.%m.%Y')
+        
+        # Calculează media și observațiile
+        media_zilnica = daily_stats['nr_colete'].mean()
+        zi_maxima = daily_stats['nr_colete'].idxmax()
+        zi_maxima_formatted = datetime.strptime(zi_maxima, '%Y-%m-%d').strftime('%d.%m')
+        
+        # Generează tabelul cu statistici zilnice
+        table_rows = ""
+        for data, row in daily_stats.iterrows():
+            data_formatted = datetime.strptime(data, '%Y-%m-%d').strftime('%d.%m')
+            diferenta_str = ""
+            if pd.notna(row['diferenta_colete']):
+                semn = "+" if row['diferenta_colete'] > 0 else ""
+                diferenta_str = f"{semn}{int(row['diferenta_colete'])}"
+                if pd.notna(row['procent_diferenta']):
+                    diferenta_str += f" ({semn}{row['procent_diferenta']:.1f}%)"
+            else:
+                diferenta_str = "-"
+            
+            table_rows += f"""
+                <tr>
+                    <td style="text-align: center;">{data_formatted}</td>
+                    <td style="text-align: right; font-weight: bold;">{int(row['nr_colete']):,}</td>
+                    <td style="text-align: center;">{diferenta_str}</td>
+                    <td style="text-align: center;">{row['tendinta']}</td>
+                </tr>
+            """
         
         html = f"""
         <html>
@@ -372,7 +541,7 @@ class EmailReportingSystem:
                 body {{ 
                     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                     line-height: 1.6; 
-                    max-width: 1200px; 
+                    max-width: 900px; 
                     margin: 0 auto; 
                     padding: 20px;
                     background-color: #f9f9f9;
@@ -383,43 +552,53 @@ class EmailReportingSystem:
                     border-radius: 8px;
                     box-shadow: 0 2px 10px rgba(0,0,0,0.1);
                 }}
-                table {{ 
-                    border-collapse: collapse; 
-                    width: 100%; 
-                    margin: 20px 0; 
-                    font-size: 13px;
-                    table-layout: fixed;
-                }}
-                th, td {{ 
-                    border: 1px solid #ddd; 
-                    padding: 8px 10px; 
-                    text-align: left;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                    white-space: nowrap;
-                }}
-                th {{ 
-                    background-color: #34495e; 
-                    color: white; 
-                    font-weight: bold; 
-                    text-align: center;
-                    font-size: 12px;
-                }}
-                /* Dimensiuni fixe pentru coloane */
-                th:nth-child(1), td:nth-child(1) {{ width: 80px; text-align: center; }} /* Data */
-                th:nth-child(2), td:nth-child(2) {{ width: 120px; }} /* Centru */
-                th:nth-child(3), td:nth-child(3) {{ width: 100px; }} /* Ruta */
-                th:nth-child(4), td:nth-child(4) {{ width: 80px; text-align: right; }} /* Nr Colete */
-                th:nth-child(5), td:nth-child(5) {{ width: 90px; text-align: right; }} /* Greutate */
-                th:nth-child(6), td:nth-child(6) {{ width: 110px; text-align: right; }} /* Procent Iesire */
-                th:nth-child(7), td:nth-child(7) {{ width: 110px; text-align: right; }} /* Procent Intrare */
-                
                 .header {{ 
                     color: #2c3e50; 
                     margin-bottom: 20px; 
                     text-align: center;
                     border-bottom: 3px solid #3498db;
                     padding-bottom: 15px;
+                }}
+                .stats-table {{ 
+                    border-collapse: collapse; 
+                    width: 100%; 
+                    margin: 20px 0; 
+                    font-size: 14px;
+                    background-color: white;
+                }}
+                .stats-table th, .stats-table td {{ 
+                    border: 1px solid #ddd; 
+                    padding: 12px 8px; 
+                    text-align: left;
+                }}
+                .stats-table th {{ 
+                    background-color: #34495e; 
+                    color: white; 
+                    font-weight: bold; 
+                    text-align: center;
+                    font-size: 13px;
+                }}
+                .intro-text {{
+                    background-color: #e8f4fd;
+                    padding: 15px;
+                    border-radius: 5px;
+                    margin: 15px 0;
+                    border-left: 4px solid #3498db;
+                }}
+                .summary-box {{
+                    background-color: #f8f9fa;
+                    padding: 15px;
+                    border-radius: 5px;
+                    margin: 15px 0;
+                    border-left: 4px solid #28a745;
+                }}
+                .chart-info {{
+                    background-color: #fff3cd;
+                    padding: 15px;
+                    border-radius: 5px;
+                    margin: 15px 0;
+                    border-left: 4px solid #ffc107;
+                    text-align: center;
                 }}
                 .footer {{ 
                     margin-top: 30px; 
@@ -429,134 +608,67 @@ class EmailReportingSystem:
                     border-top: 1px solid #ecf0f1;
                     padding-top: 15px;
                 }}
-                .percent {{ text-align: right; }}
-                .total-row {{
-                    background-color: #3498db !important;
-                    color: white !important;
-                    font-weight: bold;
-                }}
-                .total-row td {{
-                    background-color: #3498db !important;
-                    color: white !important;
-                }}
-                .intro-text {{
-                    background-color: #ecf0f1;
-                    padding: 15px;
-                    border-radius: 5px;
-                    margin: 15px 0;
-                    border-left: 4px solid #3498db;
-                }}
-                .objectives {{
-                    background-color: #e8f5e8;
-                    padding: 15px;
-                    border-radius: 5px;
-                    margin: 15px 0;
-                    border-left: 4px solid #27ae60;
-                }}
-                .objectives ul {{
-                    margin: 10px 0;
-                    padding-left: 20px;
-                }}
-                .closing {{
-                    background-color: #fff3cd;
-                    padding: 15px;
-                    border-radius: 5px;
-                    margin: 15px 0;
-                    border-left: 4px solid #ffc107;
-                }}
-                /* Stiluri pentru procente sub 97% */
-                .low-percent {{
-                    background-color: #ffebee !important;
-                    color: #c62828 !important;
-                    font-weight: bold;
-                }}
-                .good-percent {{
-                    background-color: #e8f5e8 !important;
-                    color: #2e7d32 !important;
-                }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h2>Raport Centru {centru}</h2>
-                    <p style="margin: 5px 0; color: #7f8c8d;">Monitorizare Scanare IN/OUT TRK - Ultimele 30 zile</p>
+                    <h2>📊 Raport Scanări - {centru}</h2>
+                    <p style="margin: 5px 0; color: #7f8c8d;">Ultimele 3 zile - {data_display_formatted}</p>
                 </div>
                 
                 <div class="intro-text">
                     <p><strong>Bună ziua,</strong></p>
-                    <p>Începând cu 1 septembrie, am demarat monitorizarea activă a ratei de scanare IN/OUT TRK pentru toate stațiile și hub-urile DSC.<br/>
-                    <strong>Obiectiv:</strong> Menținerea unui nivel minim de 97% este esențială pentru eficiența proceselor și calitatea serviciilor.<br/>
-                    <strong>Probleme:</strong> Suntem conștienți că pot exista situații excepționale în care unele AWB-uri nu pot fi procesate, drept urmare avem rugămintea ca situațiile recurente să le sesizați pentru a lua măsuri și a le remedia.</p>
+                    <p>Vă transmitem situația detaliată pentru ultimele 3 zile de activitate, 
+                    împreună cu graficul de evoluție pentru o vizualizare clară a tendințelor.</p>
                 </div>
                 
-                <p><strong>Mai jos găsiți statistica scanărilor de intrare/ieșire pentru stația dumneavoastră:</strong></p>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Data</th>
-                        <th>Centru</th>
-                        <th>Ruta</th>
-                        <th>Nr Colete</th>
-                        <th>Greutate (kg)</th>
-                        <th>Procent Iesire Centru</th>
-                        <th>Procent Intrare Centru</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
-        
-        total_colete = 0
-        total_greutate = 0
-        
-        for _, row in raport_data.iterrows():
-            total_colete += int(row['nr_colete'])
-            total_greutate += float(row['greutate'])
-            
-            html += f"""
-                    <tr>
-                        <td>{row['data_raport']}</td>
-                        <td>{row['centru']}</td>
-                        <td>{row['ruta']}</td>
-                        <td style="text-align: right;">{int(row['nr_colete']):,}</td>
-                        <td style="text-align: right;">{float(row['greutate']):.2f}</td>
-                        <td class="percent">{float(row['procent_iesire_centru']):.2f}%</td>
-                        <td class="percent">{float(row['procent_intrare_centru']):.2f}%</td>
-                    </tr>
-            """
-        
-        avg_iesire = raport_data['procent_iesire_centru'].mean()
-        avg_intrare = raport_data['procent_intrare_centru'].mean()
-        
-        html += f"""
-                    <tr style="background-color: #e8f4fd; font-weight: bold;">
-                        <td>-</td>
-                        <td>TOTAL</td>
-                        <td>-</td>
-                        <td style="text-align: right;">{total_colete:,}</td>
-                        <td style="text-align: right;">{total_greutate:.2f}</td>
-                        <td class="percent">{avg_iesire:.2f}%</td>
-                        <td class="percent">{avg_intrare:.2f}%</td>
-                    </tr>
-                </tbody>
-            </table>
-            <div>
-            <p>Pentru a asigura atingerea obiectivelor, va rugam:</p>
-            <ul>
-                <li>Sa identificati factorii care au determinat rata actuala;</li>
-                <li>Sa propuneti masuri concrete pentru cresterea acestui indicator.</li>
-            </ul>
-            </div>
-            <div>
-            <p>Colaborarea ca feedback-ul dumneavoastra sunt foarte important pentru imbuntatirea continua a performantei</br>
-            Echipa noastra va sta la dispozitie pentru clarificari punctuale, sesiuni rapide de training sau asistenta tehnica.</br>
-            </p>
-            <p>Va multumim pentru implicare si colaborare!</p>
-            </div>
-            
-            <div class="footer">
-                <p>Data generare: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
-                <p>Datele totale reprezintă media pe ultimele 30 de zile.</p>
+                <h3>📋 SITUAȚIA DETALIATĂ</h3>
+                <table class="stats-table">
+                    <thead>
+                        <tr>
+                            <th>Data</th>
+                            <th>Scanări</th>
+                            <th>Diferența</th>
+                            <th>Tendința</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {table_rows}
+                    </tbody>
+                </table>
+                
+                <div class="summary-box">
+                    <h4>💡 OBSERVAȚII</h4>
+                    <ul>
+                        <li><strong>Media zilnică:</strong> {int(media_zilnica):,} scanări</li>
+                        <li><strong>Zi cu cele mai multe scanări:</strong> {zi_maxima_formatted}</li>
+                        <li><strong>Evoluția:</strong> Vezi graficul atașat pentru tendințe detaliate</li>
+                    </ul>
+                </div>
+                
+                <div class="chart-info">
+                    <h4>📈 GRAFIC DE EVOLUȚIE</h4>
+                    <p>Graficul cu evoluția scanărilor pe ultimele 3 zile este atașat la acest email.<br/>
+                    <em>Graficul arată media zilnică și tendințele pentru o analiză vizuală completă.</em></p>
+                </div>
+                
+                <div style="background-color: #e8f5e8; padding: 15px; border-radius: 5px; margin: 15px 0; border-left: 4px solid #27ae60;">
+                    <p><strong>Pentru optimizarea continuă:</strong></p>
+                    <ul>
+                        <li>Analizați tendințele din grafic pentru identificarea cauzelor</li>
+                        <li>Propuneți măsuri concrete pentru îmbunătățirea performanțelor</li>
+                        <li>Raportați situațiile excepționale pentru rezolvare rapidă</li>
+                    </ul>
+                </div>
+                
+                <p><strong>Echipa noastră rămâne la dispoziția dumneavoastră pentru clarificări și suport tehnic.</strong></p>
+                <p>Vă mulțumim pentru colaborare!</p>
+                
+                <div class="footer">
+                    <p>Data generare: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+                    <p>Raport generat automat pentru ultimele 3 zile de activitate.</p>
+                </div>
             </div>
         </body>
         </html>
@@ -565,7 +677,7 @@ class EmailReportingSystem:
         return html
     
     def send_centre_report(self, centru, data_raport):
-        """Trimite raportul pentru un centru specific"""
+        """Trimite raportul pentru un centru specific - cu grafic PNG atașat"""
         try:
             # Încarcă configurațiile
             email_config = self.load_email_config()
@@ -580,26 +692,63 @@ class EmailReportingSystem:
             addresses_str = ', '.join(email_addresses[centru])
             self.logger.info(f"Pregătesc email pentru centrul {centru} → destinatari: {addresses_str}")
             
-            # Obține datele pentru raport
-            raport_data = self.get_centre_report_last_30_days(centru, data_raport)
+            # Verifică dacă există date pentru ultimele 3 zile
+            daily_stats = self.get_daily_stats_last_3_days(centru, data_raport)
             
-            if raport_data.empty:
-                self.logger.info(f"Nu există date pentru centrul {centru} în ultimele 30 de zile")
+            if daily_stats.empty:
+                self.logger.info(f"Nu există date pentru centrul {centru} în ultimele 3 zile")
                 return True
             
-            # Generează HTML-ul raportului
-            html_content = self.generate_email_report_html(centru, raport_data, data_raport)
+            # Generează graficul PNG
+            self.logger.info(f"Generez graficul de evoluție pentru {centru}...")
+            chart_path = self.generate_evolution_chart(centru, data_raport)
+            
+            if not chart_path or not os.path.exists(chart_path):
+                self.logger.warning(f"Nu s-a putut genera graficul pentru {centru}")
+                chart_path = None
+            else:
+                self.logger.info(f"Grafic generat cu succes: {chart_path}")
+            
+            # Generează HTML-ul raportului (acum folosește ultimele 3 zile)
+            html_content = self.generate_email_report_html(centru, None, data_raport)
             
             # Configurează email-ul
-            msg = MIMEMultipart('alternative')
+            msg = MIMEMultipart('mixed')  # 'mixed' pentru atașamente
             msg['From'] = f"{email_config['sender_name']} <{email_config['email']}>"
             msg['To'] = ', '.join(email_addresses[centru])
-            subject = f"Raport scanare IN/OUT TRK {centru} - {datetime.strptime(data_raport, '%Y-%m-%d').strftime('%d.%m.%Y')}"
+            subject = f"Raport scanări {centru} - Ultimele 3 zile - {datetime.strptime(data_raport, '%Y-%m-%d').strftime('%d.%m.%Y')}"
             msg['Subject'] = subject
             
             # Adaugă conținutul HTML
             html_part = MIMEText(html_content, 'html', 'utf-8')
             msg.attach(html_part)
+            
+            # Adaugă graficul ca atașament dacă există
+            if chart_path and os.path.exists(chart_path):
+                try:
+                    with open(chart_path, 'rb') as f:
+                        chart_data = f.read()
+                    
+                    chart_attachment = MIMEBase('image', 'png')
+                    chart_attachment.set_payload(chart_data)
+                    encoders.encode_base64(chart_attachment)
+                    chart_attachment.add_header(
+                        'Content-Disposition',
+                        f'attachment; filename="Grafic_Evolutie_{centru}_{data_raport}.png"'
+                    )
+                    msg.attach(chart_attachment)
+                    self.logger.info(f"Grafic atașat cu succes: {os.path.basename(chart_path)}")
+                    
+                    # Șterge fișierul temporar după atașare
+                    try:
+                        os.remove(chart_path)
+                        self.logger.info(f"Fișier temporar șters: {chart_path}")
+                    except:
+                        pass  # Nu e critic dacă nu se poate șterge
+                        
+                except Exception as e:
+                    self.logger.warning(f"Eroare la atașarea graficului: {str(e)}")
+                    # Continuă fără grafic
             
             # Log detalii email
             self.logger.info(f"Email configurat: '{subject}' de la {email_config['sender_name']} ({len(html_content):,} caractere HTML)")
@@ -625,10 +774,10 @@ class EmailReportingSystem:
             return False
     
     def send_all_centre_reports(self, data_raport):
-        """Trimite rapoarte pentru toate centrele care au date"""
+        """Trimite rapoarte pentru toate centrele care au date în ultimele 3 zile"""
         conn = sqlite3.connect(self.db_path)
         
-        # Obține lista centrelor cu date
+        # Obține lista centrelor cu date în ultimele 3 zile
         query = '''
             SELECT DISTINCT centru 
             FROM rapoarte_istoric 
@@ -637,9 +786,13 @@ class EmailReportingSystem:
             ORDER BY centru
         '''
         
-        data_start = (datetime.strptime(data_raport, '%Y-%m-%d') - timedelta(days=30)).strftime('%Y-%m-%d')
+        # Calculează data de start pentru ultimele 3 zile
+        data_end = datetime.strptime(data_raport, '%Y-%m-%d')
+        data_start = data_end - timedelta(days=2)  # 3 zile: azi, ieri, alaltăieri
+        data_start_str = data_start.strftime('%Y-%m-%d')
+        
         cursor = conn.cursor()
-        cursor.execute(query, (data_start,))
+        cursor.execute(query, (data_start_str,))
         centre = [row[0] for row in cursor.fetchall()]
         conn.close()
         
